@@ -1,0 +1,142 @@
+# Private reference material must stay local. Public source notes and data
+# dictionaries under docs/reference remain trackable.
+/docs/reference/private/
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+/certs/
+/secrets/
+/instances/
+**/app.env
+**/instance.env
+/deploy/ssl/
+*.pem
+*.key
+*.crt
+*.cer
+*.csr
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+/dist/
+/frontend/dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+/var/
+# Local exhibit uploads (production should configure a persistent external path).
+/var/exhibit-images/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# uv
+.uv/
+.uv-cache/
+.uv-cache-codex/
+uv-cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.pytest_tmp/
+.pytest-tmp/
+.pytest-tmp-*/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.ruff_cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# MyPy
+.mypy_cache/
+
+# Git worktrees
+.worktrees/
+
+# Logs
+logs/
+!docs/logs/
+!docs/logs/CHANGELOG.md
+*.log
+backend_uvicorn.log
+
+# Performance test reports (keep directory structure but ignore generated reports)
+performance_reports/*.html
+performance_reports/*.txt
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Operator-local imports and server runtime artifacts. Versioned museum CSV
+# snapshots under data/museum_* remain trackable.
+/data/local-imports/
+~$*.xls
+~$*.xlsx
+~$*.csv
+/uploads/
+/backup/
+/backups/
+museai_*.sql.gz
+exhibit-images_*.tar.gz
+*.pid
+*.sock
+
+# Local AI-assistant and collaboration state
+/CLAUDE.md
+/AGENTS.md
+/.agents/
+.claude/
+/.codex/
+/.serena/
+.superpowers/
+codex.md
+/docs/DESIGN.md
+/docs/CURRENT_TASK.md
+/docs/agent-runs/
+
+# Local task artifacts (reports, figures, previews, probes, and scratch copies).
+# Keep new task output outside the application tree, e.g. MuseAI-TestResults.
+/tmp/
+/work/
+/output/
+/.dsh-office-*/
+/.probe_*.py
+/.pytest-tmp*/

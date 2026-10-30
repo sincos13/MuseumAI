@@ -1,0 +1,259 @@
+"""LangChain集成模块。
+
+提供LLM、Embeddings、Retriever和RAG Agent的工厂函数。
+"""
+
+import json
+from typing import Any
+
+from langchain_openai import ChatOpenAI
+from loguru import logger
+
+from app.application.ports.prompt_gateway import PromptGateway
+from app.application.workflows.query_transform import ConversationAwareQueryRewriter
+from app.application.workflows.reflection_prompts import ReflectionPromptService
+from app.config.settings import Settings
+from app.infra.langchain.agents import RAGAgent
+from app.infra.langchain.curator_agent import CuratorAgent
+from app.infra.langchain.curator_tools import (
+    KnowledgeRetrievalTool,
+    NarrativeGenerationTool,
+    PathPlanningTool,
+    PreferenceManagementTool,
+    ReflectionPromptTool,
+    create_curator_tools,
+)
+from app.infra.langchain.embeddings import (
+    CustomOllamaEmbeddings,
+    LangChainEmbeddings,
+    OpenAICompatibleEmbeddings,
+)
+from app.infra.langchain.retrievers import RRFRetriever, UnifiedRetriever
+from app.infra.providers.llm import build_extra_body_for_compat, detect_compat_mode
+from app.infra.providers.rerank import create_rerank_provider as _create_rerank_provider_impl
+
+
+def create_embeddings(settings: Settings) -> LangChainEmbeddings:
+    """创建Embeddings实例，根据EMBEDDING_PROVIDER选择提供者。"""
+    provider_type = settings.EMBEDDING_PROVIDER.lower()
+
+    if provider_type == "openai":
+        if not settings.EMBEDDING_OPENAI_BASE_URL:
+            raise ValueError(
+                "EMBEDDING_OPENAI_BASE_URL must be set when EMBEDDING_PROVIDER=openai"
+            )
+        if not settings.EMBEDDING_OPENAI_API_KEY:
+            raise ValueError(
+                "EMBEDDING_OPENAI_API_KEY must be set when EMBEDDING_PROVIDER=openai"
+            )
+        if not settings.EMBEDDING_OPENAI_MODEL:
+            raise ValueError(
+                "EMBEDDING_OPENAI_MODEL must be set when EMBEDDING_PROVIDER=openai"
+            )
+        return OpenAICompatibleEmbeddings(
+            base_url=settings.EMBEDDING_OPENAI_BASE_URL,
+            api_key=settings.EMBEDDING_OPENAI_API_KEY,
+            model=settings.EMBEDDING_OPENAI_MODEL,
+            dims=settings.EMBEDDING_DIMS,
+        )
+
+    # Default: ollama
+    return CustomOllamaEmbeddings(
+        base_url=settings.EMBEDDING_OLLAMA_BASE_URL,
+        model=settings.EMBEDDING_OLLAMA_MODEL,
+        dims=settings.EMBEDDING_DIMS,
+    )
+
+
+def create_llm(settings: Settings, callbacks: list | None = None) -> ChatOpenAI:
+    """创建LLM实例。"""
+    default_headers: dict[str, str] | None = None
+    if settings.LLM_HEADERS:
+        try:
+            default_headers = json.loads(settings.LLM_HEADERS)
+        except json.JSONDecodeError:
+            logger.warning("LLM_HEADERS is not valid JSON, ignoring: {}", settings.LLM_HEADERS)
+    model_name = getattr(settings, "LLM_TOUR_MODEL", None) or settings.LLM_MODEL
+    compat_mode = detect_compat_mode(
+        settings.LLM_BASE_URL,
+        model_name,
+        getattr(settings, "LLM_PROVIDER", "openai_compatible"),
+        getattr(settings, "LLM_COMPAT_MODE", "auto"),
+    )
+    extra_body = build_extra_body_for_compat(compat_mode, settings.LLM_ENABLE_THINKING)
+    kwargs: dict[str, Any] = {
+        "base_url": settings.LLM_BASE_URL,
+        "api_key": settings.LLM_API_KEY,
+        "model": model_name,
+        "default_headers": default_headers,
+        "temperature": settings.LLM_TEMPERATURE,
+        "callbacks": callbacks,
+    }
+    if settings.LLM_MAX_TOKENS > 0:
+        kwargs["max_tokens"] = settings.LLM_MAX_TOKENS
+    if extra_body:
+        kwargs["model_kwargs"] = {"extra_body": extra_body}
+    return ChatOpenAI(
+        **kwargs,
+    )
+
+
+def create_retriever(
+    es_client: Any,
+    embeddings: LangChainEmbeddings,
+    settings: Settings,
+) -> UnifiedRetriever:
+    """创建Retriever实例。
+
+    使用UnifiedRetriever支持搜索所有内容类型（文档、展品等）。
+    """
+    return UnifiedRetriever(
+        es_client=es_client,
+        embeddings=embeddings,
+        top_k=settings.RETRIEVAL_TOP_K,
+        rrf_k=60,
+        chunk_levels=[2, 3],
+    )
+
+
+def create_rerank_provider(settings: Settings) -> Any:
+    """创建Rerank提供者实例。
+
+    Args:
+        settings: 应用配置
+
+    Returns:
+        Rerank提供者实例，如果未配置则返回None
+    """
+    return _create_rerank_provider_impl(settings)
+
+
+def create_query_rewriter(
+    llm_provider: Any,
+    prompt_gateway: PromptGateway | None = None,
+) -> ConversationAwareQueryRewriter:
+    """创建查询重写器实例。
+
+    Args:
+        llm_provider: LLM提供者实例
+        prompt_gateway: Prompt网关（可选）
+
+    Returns:
+        查询重写器实例
+    """
+    return ConversationAwareQueryRewriter(llm_provider, prompt_gateway=prompt_gateway)
+
+
+def create_rag_agent(
+    llm: Any,
+    retriever: Any,
+    settings: Settings,
+    rerank_provider: Any | None = None,
+    query_rewriter: ConversationAwareQueryRewriter | None = None,
+    prompt_gateway: PromptGateway | None = None,
+    llm_provider: Any | None = None,
+) -> RAGAgent:
+    """创建RAG Agent实例。
+
+    Args:
+        llm: 语言模型实例
+        retriever: 检索器实例
+        settings: 应用配置
+        rerank_provider: Rerank提供者（可选）
+        query_rewriter: 查询重写器（可选）
+        prompt_gateway: Prompt网关（可选）
+        llm_provider: LLM提供者（可选，用于查询转换）
+
+    Returns:
+        RAG Agent实例
+    """
+    from app.application.document_filter import FilterConfig
+
+    filter_config = FilterConfig(
+        absolute_threshold=settings.RERANK_ABSOLUTE_THRESHOLD,
+        relative_gap=settings.RERANK_RELATIVE_GAP,
+        min_docs=settings.RERANK_MIN_DOCS,
+        max_docs=settings.RERANK_MAX_DOCS,
+    )
+
+    return RAGAgent(
+        llm=llm,
+        retriever=retriever,
+        rerank_provider=rerank_provider,
+        query_rewriter=query_rewriter,
+        prompt_gateway=prompt_gateway,
+        llm_provider=llm_provider,
+        score_threshold=0.7,
+        max_attempts=3,
+        rerank_top_n=settings.RERANK_TOP_N,
+        merge_enabled=settings.CHUNK_MERGE_ENABLED,
+        merge_max_level=settings.CHUNK_MERGE_MAX_LEVEL,
+        merge_max_parents=settings.CHUNK_MERGE_MAX_PARENTS,
+        filter_config=filter_config,
+    )
+
+
+def create_curator_agent(
+    llm: Any,
+    rag_agent: Any,
+    exhibit_repository: Any,
+    profile_repository: Any,
+    session_id: str,
+    prompt_gateway: PromptGateway | None = None,
+    reflection_service: ReflectionPromptService | None = None,
+    verbose: bool = False,
+) -> CuratorAgent:
+    """创建Curator Agent实例。
+
+    Args:
+        llm: 语言模型实例
+        rag_agent: RAG Agent实例，用于知识检索
+        exhibit_repository: 展品数据仓库
+        profile_repository: 参观者画像仓库
+        session_id: 会话ID
+        prompt_gateway: Prompt网关（可选）
+        reflection_service: ReflectionPromptService实例（可选）
+        verbose: 是否启用详细日志
+
+    Returns:
+        Curator Agent实例
+    """
+    tools = create_curator_tools(
+        exhibit_repository=exhibit_repository,
+        profile_repository=profile_repository,
+        rag_agent=rag_agent,
+        llm=llm,
+        prompt_gateway=prompt_gateway,
+        reflection_service=reflection_service,
+    )
+
+    return CuratorAgent(
+        llm=llm,
+        tools=tools,
+        session_id=session_id,
+        prompt_gateway=prompt_gateway,
+        verbose=verbose,
+    )
+
+
+__all__ = [
+    "CustomOllamaEmbeddings",
+    "LangChainEmbeddings",
+    "OpenAICompatibleEmbeddings",
+    "create_embeddings",
+    "create_llm",
+    "create_retriever",
+    "create_rerank_provider",
+    "create_query_rewriter",
+    "create_rag_agent",
+    "create_curator_agent",
+    "CuratorAgent",
+    "RRFRetriever",
+    "UnifiedRetriever",
+    "PathPlanningTool",
+    "KnowledgeRetrievalTool",
+    "NarrativeGenerationTool",
+    "ReflectionPromptTool",
+    "PreferenceManagementTool",
+    "create_curator_tools",
+]

@@ -1,0 +1,303 @@
+import asyncio
+import json
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from types import TracebackType
+from typing import Any, Protocol, Self
+
+from loguru import logger
+from openai import APIError, APIStatusError, AsyncOpenAI
+from pydantic import BaseModel
+
+from app.config.settings import Settings
+from app.domain.exceptions import LLMError
+
+LLM_COMPAT_MODES = {"auto", "openai", "deepseek", "qwen"}
+
+
+def detect_compat_mode(
+    base_url: str,
+    model: str,
+    provider: str | None = None,
+    explicit: str | None = None,
+) -> str:
+    requested = (explicit or "auto").strip().lower()
+    if requested in LLM_COMPAT_MODES and requested != "auto":
+        return requested
+
+    haystack = " ".join([base_url or "", model or "", provider or ""]).lower()
+    if "dashscope" in haystack or "aliyuncs" in haystack or "qwen" in haystack:
+        return "qwen"
+    if "deepseek" in haystack:
+        return "deepseek"
+    return "openai"
+
+
+def build_extra_body_for_compat(compat_mode: str, enable_thinking: bool) -> dict[str, Any]:
+    if enable_thinking:
+        return {}
+    mode = compat_mode.strip().lower()
+    if mode == "qwen":
+        return {"enable_thinking": False}
+    if mode == "deepseek":
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
+class LLMResponse(BaseModel):
+    content: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    duration_ms: int
+
+
+class LLMProvider(Protocol):
+    async def generate(self, messages: list[dict[str, Any]], model: str | None = None) -> LLMResponse: ...
+
+    def generate_stream(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+    ) -> AsyncGenerator[str, None]: ...
+
+
+class OpenAICompatibleProvider:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float = 60.0,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        default_headers: dict[str, str] | None = None,
+        trace_recorder: Any | None = None,
+        temperature: float = 0.5,
+        max_tokens: int = 2048,
+        enable_thinking: bool = False,
+        compat_mode: str = "auto",
+        provider_name: str = "openai_compatible",
+    ):
+        self.base_url = base_url
+        self.model = model
+        self.provider_name = provider_name
+        self.compat_mode = detect_compat_mode(base_url, model, provider_name, compat_mode)
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.enable_thinking = enable_thinking
+        self.supports_model_override = True
+        self.tour_model = model
+        self.report_model = model
+        self.client = AsyncOpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            default_headers=default_headers or None,
+        )
+        self.trace_recorder = trace_recorder
+
+    @classmethod
+    def from_settings(cls, settings: Settings, trace_recorder: Any | None = None) -> Self:
+        default_headers: dict[str, str] | None = None
+        if settings.LLM_HEADERS:
+            try:
+                default_headers = json.loads(settings.LLM_HEADERS)
+            except json.JSONDecodeError:
+                logger.warning("LLM_HEADERS is not valid JSON, ignoring: {}", settings.LLM_HEADERS)
+        return cls(
+            base_url=settings.LLM_BASE_URL,
+            api_key=settings.LLM_API_KEY,
+            model=getattr(settings, "LLM_TOUR_MODEL", None) or settings.LLM_MODEL,
+            default_headers=default_headers,
+            trace_recorder=trace_recorder,
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=settings.LLM_MAX_TOKENS,
+            enable_thinking=settings.LLM_ENABLE_THINKING,
+            compat_mode=getattr(settings, "LLM_COMPAT_MODE", "auto"),
+            provider_name=getattr(settings, "LLM_PROVIDER", "openai_compatible"),
+        )._with_purpose_models(
+            tour_model=getattr(settings, "LLM_TOUR_MODEL", None) or settings.LLM_MODEL,
+            report_model=getattr(settings, "LLM_REPORT_MODEL", None) or settings.LLM_MODEL,
+        )
+
+    def _with_purpose_models(self, tour_model: str, report_model: str) -> Self:
+        self.tour_model = tour_model
+        self.report_model = report_model
+        return self
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self.client.close()
+
+    def _log_api_error(self, error: APIError, call_id: str, attempt: int | None = None) -> None:
+        """Log detailed API error info for debugging third-party provider issues."""
+        attempt_str = f" attempt={attempt}" if attempt is not None else ""
+        logger.warning(
+            "LLM API error[{call_id}]{attempt}: type={err_type}, message={msg}",
+            call_id=call_id,
+            attempt=attempt_str,
+            err_type=type(error).__name__,
+            msg=str(error),
+        )
+        if isinstance(error, APIStatusError):
+            logger.debug(
+                "LLM API status error detail[{call_id}]: status={status}, headers={headers}, body={body}",
+                call_id=call_id,
+                status=error.status_code,
+                headers=dict(error.response.headers) if error.response else None,
+                body=error.body,
+            )
+        else:
+            logger.debug(
+                "LLM API error detail[{call_id}]: body={body}",
+                call_id=call_id,
+                body=getattr(error, "body", None),
+            )
+
+    async def generate(self, messages: list[dict[str, Any]], model: str | None = None) -> LLMResponse:
+        start_time = time.time()
+        last_error: APIError | None = None
+        call_id = f"llm-{uuid.uuid4().hex[:12]}"
+        started_at = datetime.now(UTC)
+        request_model = model or self.model
+
+        extra_body = build_extra_body_for_compat(self.compat_mode, self.enable_thinking)
+
+        for attempt in range(self.max_retries):
+            try:
+                response = await self.client.chat.completions.create(  # type: ignore[arg-type]
+                    model=request_model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens if self.max_tokens > 0 else None,
+                    extra_body=extra_body or None,
+                )
+                duration_ms = int((time.time() - start_time) * 1000)
+                ended_at = datetime.now(UTC)
+
+                if not response.choices:
+                    raise LLMError("LLM returned empty choices in response")
+                content = response.choices[0].message.content or ""
+                usage = response.usage
+
+                if usage is None:
+                    logger.warning("LLM response usage is None, defaulting token counts to 0")
+
+                if self.trace_recorder is not None:
+                    await self.trace_recorder.record_call_once(
+                        call_id=call_id,
+                        provider=f"openai-compatible:{self.compat_mode}",
+                        model=request_model,
+                        status="success",
+                        source="openai-compatible",
+                        base_url=self.base_url,
+                        request_payload={"model": request_model, "messages": messages},
+                        response_payload={
+                            "model": response.model,
+                            "choices": [{"message": {"content": content}}],
+                            "usage": {
+                                "prompt_tokens": usage.prompt_tokens if usage else 0,
+                                "completion_tokens": usage.completion_tokens if usage else 0,
+                                "total_tokens": usage.total_tokens if usage else 0,
+                            },
+                        },
+                        prompt_tokens=usage.prompt_tokens if usage else 0,
+                        completion_tokens=usage.completion_tokens if usage else 0,
+                        total_tokens=usage.total_tokens if usage else 0,
+                        started_at=started_at,
+                        ended_at=ended_at,
+                    )
+
+                return LLMResponse(
+                    content=content,
+                    model=response.model,
+                    prompt_tokens=usage.prompt_tokens if usage else 0,
+                    completion_tokens=usage.completion_tokens if usage else 0,
+                    duration_ms=duration_ms,
+                )
+            except APIError as e:
+                last_error = e
+                self._log_api_error(e, call_id, attempt)
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (2**attempt))
+
+        ended_at = datetime.now(UTC)
+        if self.trace_recorder is not None:
+            await self.trace_recorder.record_call_error(
+                call_id=call_id,
+                error_type=type(last_error).__name__ if last_error else "UnknownError",
+                error_message=str(last_error) if last_error else "unknown error",
+                source="openai-compatible",
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+        raise LLMError(str(last_error)) from last_error
+
+    async def generate_stream(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+    ) -> AsyncGenerator[str, None]:
+        call_id = f"llm-{uuid.uuid4().hex[:12]}"
+        started_at = datetime.now(UTC)
+        chunks: list[str] = []
+        request_model = model or self.model
+        extra_body = build_extra_body_for_compat(self.compat_mode, self.enable_thinking)
+        try:
+            stream = await self.client.chat.completions.create(  # type: ignore[arg-type]
+                model=request_model,
+                messages=messages,
+                stream=True,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens if self.max_tokens > 0 else None,
+                extra_body=extra_body or None,
+            )
+            async for chunk in stream:  # type: ignore[union-attr]
+                if not chunk.choices:
+                    continue
+                content = chunk.choices[0].delta.content
+                if content is not None:
+                    chunks.append(content)
+                    yield content
+            ended_at = datetime.now(UTC)
+            if self.trace_recorder is not None:
+                await self.trace_recorder.record_call_once(
+                    call_id=call_id,
+                    provider=f"openai-compatible:{self.compat_mode}",
+                    model=request_model,
+                    status="success",
+                    source="openai-compatible",
+                    base_url=self.base_url,
+                    request_payload={"model": request_model, "messages": messages},
+                    response_payload={"content": "".join(chunks)},
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
+        except APIError as e:
+            ended_at = datetime.now(UTC)
+            self._log_api_error(e, call_id)
+            if self.trace_recorder is not None:
+                await self.trace_recorder.record_call_error(
+                    call_id=call_id,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                    source="openai-compatible",
+                    started_at=started_at,
+                    ended_at=ended_at,
+                )
+            raise LLMError(str(e)) from e

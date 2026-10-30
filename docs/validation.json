@@ -1,0 +1,32 @@
+{
+  "backend_imported_modules": 157,
+  "backend_all_modules_from_export": true,
+  "backend_health_http_status": 200,
+  "migration_revisions": 22,
+  "migration_single_head": true,
+  "template_validated": true,
+  "template_halls": 1,
+  "template_exhibits": 1,
+  "configuration_creation": "passed",
+  "existing_credentials_overwrite_refused": true,
+  "docker_compose_services": [
+    "backend",
+    "elasticsearch",
+    "frontend",
+    "operator",
+    "postgres",
+    "redis"
+  ],
+  "docker_compose_config": "passed",
+  "original_application_sources_unchanged": true,
+  "no_local_environment_or_private_data_in_package": true,
+  "frontend_clean_install_and_build": "passed: npm ci --offline, npm run build",
+  "fresh_docker_image_build": "not performed",
+  "production_model_https_load_acceptance": "requires target deployment configuration",
+  "frontend_install_packages": 60,
+  "source_workspace_regression_tests": {
+    "backend_selected": 30,
+    "frontend_all": 193,
+    "status": "passed"
+  }
+}

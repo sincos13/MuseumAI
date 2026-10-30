@@ -1,0 +1,289 @@
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.entities import Exhibit
+from app.domain.value_objects import ExhibitId, Location
+
+from ..models import Exhibit as ExhibitORM
+from ..models import Hall as HallORM
+
+
+def _catalog_ordering():
+    """Keep imported catalog order deterministic across PostgreSQL and SQLite."""
+    return (
+        ExhibitORM.display_order.asc().nulls_last(),
+        ExhibitORM.created_at.asc(),
+        ExhibitORM.id.asc(),
+    )
+
+
+class PostgresExhibitRepository:
+    def __init__(
+        self,
+        session: AsyncSession,
+        visible_halls: set[str] | frozenset[str] | None = None,
+        *,
+        require_active_hall: bool = False,
+    ):
+        self._session = session
+        self._require_active_hall = require_active_hall
+        self._visible_halls = frozenset(visible_halls) if visible_halls is not None else None
+
+    def _apply_hall_visibility(self, query):
+        """Scope public reads to active halls without changing admin repositories."""
+        if self._visible_halls is None and not self._require_active_hall:
+            return query
+        query = query.join(HallORM, HallORM.slug == ExhibitORM.hall).where(
+            ExhibitORM.is_active.is_(True),
+            HallORM.is_active.is_(True),
+        )
+        if self._visible_halls is not None:
+            query = query.where(ExhibitORM.hall.in_(self._visible_halls))
+        return query
+
+    def _to_entity(self, orm: ExhibitORM) -> Exhibit:
+        return Exhibit(
+            id=ExhibitId(orm.id),
+            name=orm.name,
+            description=orm.description or "",
+            location=Location(
+                x=orm.location_x or 0.0,
+                y=orm.location_y or 0.0,
+                floor=orm.floor or 1,
+            ),
+            hall=orm.hall or "",
+            category=orm.category or "",
+            era=orm.era or "",
+            importance=orm.importance,
+            estimated_visit_time=orm.estimated_visit_time or 0,
+            document_id=orm.document_id or "",
+            is_active=orm.is_active,
+            created_at=orm.created_at,
+            updated_at=orm.updated_at,
+            image_url=orm.image_url,
+            image_path=orm.image_path,
+            source_record_id=orm.source_record_id,
+        )
+
+    async def get_by_id(self, exhibit_id: ExhibitId) -> Exhibit | None:
+        query = select(ExhibitORM).where(ExhibitORM.id == exhibit_id.value)
+        result = await self._session.execute(self._apply_hall_visibility(query))
+        orm = result.scalar_one_or_none()
+        return self._to_entity(orm) if orm else None
+
+    async def list_all(
+        self,
+        include_inactive: bool = False,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[Exhibit]:
+        query = select(ExhibitORM)
+        query = self._apply_hall_visibility(query)
+        if not include_inactive:
+            query = query.where(ExhibitORM.is_active.is_(True))
+        query = query.order_by(*_catalog_ordering()).offset(skip).limit(limit)
+        result = await self._session.execute(query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def list_by_category(
+        self,
+        category: str,
+        include_inactive: bool = False,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[Exhibit]:
+        query = select(ExhibitORM).where(ExhibitORM.category == category)
+        query = self._apply_hall_visibility(query)
+        if not include_inactive:
+            query = query.where(ExhibitORM.is_active.is_(True))
+        query = query.order_by(*_catalog_ordering()).offset(skip).limit(limit)
+        result = await self._session.execute(query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def list_by_hall(
+        self,
+        hall: str,
+        include_inactive: bool = False,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[Exhibit]:
+        query = select(ExhibitORM).where(ExhibitORM.hall == hall)
+        query = self._apply_hall_visibility(query)
+        if not include_inactive:
+            query = query.where(ExhibitORM.is_active.is_(True))
+        query = query.order_by(*_catalog_ordering()).offset(skip).limit(limit)
+        result = await self._session.execute(query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def find_by_interests(self, interests: list[str], limit: int = 10) -> list[Exhibit]:
+        if not interests:
+            return []
+        query = self._apply_hall_visibility(
+            select(ExhibitORM).where(ExhibitORM.category.in_(interests)).where(ExhibitORM.is_active.is_(True))
+        )
+        query = query.limit(limit)
+        result = await self._session.execute(query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def save(self, exhibit: Exhibit) -> Exhibit:
+        orm = await self._session.get(ExhibitORM, exhibit.id.value)
+
+        if orm is None:
+            orm = ExhibitORM(
+                id=exhibit.id.value,
+                name=exhibit.name,
+                description=exhibit.description,
+                location_x=exhibit.location.x,
+                location_y=exhibit.location.y,
+                floor=exhibit.location.floor,
+                hall=exhibit.hall,
+                category=exhibit.category,
+                era=exhibit.era,
+                importance=exhibit.importance,
+                estimated_visit_time=exhibit.estimated_visit_time,
+                document_id=exhibit.document_id or None,
+                is_active=exhibit.is_active,
+                created_at=exhibit.created_at,
+                updated_at=exhibit.updated_at,
+                image_url=exhibit.image_url,
+                image_path=exhibit.image_path,
+            )
+            self._session.add(orm)
+        else:
+            orm.name = exhibit.name
+            orm.description = exhibit.description
+            orm.location_x = exhibit.location.x
+            orm.location_y = exhibit.location.y
+            orm.floor = exhibit.location.floor
+            orm.hall = exhibit.hall
+            orm.category = exhibit.category
+            orm.era = exhibit.era
+            orm.importance = exhibit.importance
+            orm.estimated_visit_time = exhibit.estimated_visit_time
+            orm.document_id = exhibit.document_id or None
+            orm.is_active = exhibit.is_active
+            orm.updated_at = exhibit.updated_at
+            orm.image_url = exhibit.image_url
+            orm.image_path = exhibit.image_path
+
+        await self._session.flush()
+        return self._to_entity(orm)
+
+    async def delete(self, exhibit_id: ExhibitId) -> bool:
+        orm = await self._session.get(ExhibitORM, exhibit_id.value)
+        if orm is None:
+            return False
+        await self._session.delete(orm)
+        await self._session.flush()
+        return True
+
+    async def list_all_active(self) -> list[Exhibit]:
+        query = self._apply_hall_visibility(select(ExhibitORM).where(ExhibitORM.is_active.is_(True)))
+        query = query.order_by(*_catalog_ordering())
+        result = await self._session.execute(query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def list_with_filters(
+        self,
+        category: str | None = None,
+        hall: str | None = None,
+        floor: int | None = None,
+        skip: int = 0,
+        limit: int = 100,
+    ) -> list[Exhibit]:
+        query = select(ExhibitORM).where(ExhibitORM.is_active.is_(True))
+        query = self._apply_hall_visibility(query)
+
+        if category is not None:
+            query = query.where(ExhibitORM.category == category)
+        if hall is not None:
+            query = query.where(ExhibitORM.hall == hall)
+        if floor is not None:
+            query = query.where(ExhibitORM.floor == floor)
+
+        query = query.order_by(*_catalog_ordering()).offset(skip).limit(limit)
+        result = await self._session.execute(query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def search_by_name(
+        self,
+        query: str,
+        category: str | None = None,
+        hall: str | None = None,
+        floor: int | None = None,
+        skip: int = 0,
+        limit: int = 20,
+    ) -> list[Exhibit]:
+        escaped_query = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        sql_query = (
+            select(ExhibitORM).where(ExhibitORM.is_active.is_(True)).where(ExhibitORM.name.ilike(f"%{escaped_query}%"))
+        )
+        sql_query = self._apply_hall_visibility(sql_query)
+
+        if category is not None:
+            sql_query = sql_query.where(ExhibitORM.category == category)
+        if hall is not None:
+            sql_query = sql_query.where(ExhibitORM.hall == hall)
+        if floor is not None:
+            sql_query = sql_query.where(ExhibitORM.floor == floor)
+
+        sql_query = sql_query.order_by(*_catalog_ordering()).offset(skip).limit(limit)
+        result = await self._session.execute(sql_query)
+        return [self._to_entity(orm) for orm in result.scalars().all()]
+
+    async def count_with_filters(
+        self,
+        category: str | None = None,
+        hall: str | None = None,
+        floor: int | None = None,
+    ) -> int:
+        query = select(func.count()).select_from(ExhibitORM).where(ExhibitORM.is_active.is_(True))
+        query = self._apply_hall_visibility(query)
+
+        if category is not None:
+            query = query.where(ExhibitORM.category == category)
+        if hall is not None:
+            query = query.where(ExhibitORM.hall == hall)
+        if floor is not None:
+            query = query.where(ExhibitORM.floor == floor)
+
+        result = await self._session.execute(query)
+        return int(result.scalar_one() or 0)
+
+    async def count_search_by_name(
+        self,
+        query: str,
+        category: str | None = None,
+        hall: str | None = None,
+        floor: int | None = None,
+    ) -> int:
+        escaped_query = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+        sql_query = (
+            select(func.count())
+            .select_from(ExhibitORM)
+            .where(ExhibitORM.is_active.is_(True))
+            .where(ExhibitORM.name.ilike(f"%{escaped_query}%"))
+        )
+        sql_query = self._apply_hall_visibility(sql_query)
+
+        if category is not None:
+            sql_query = sql_query.where(ExhibitORM.category == category)
+        if hall is not None:
+            sql_query = sql_query.where(ExhibitORM.hall == hall)
+        if floor is not None:
+            sql_query = sql_query.where(ExhibitORM.floor == floor)
+
+        result = await self._session.execute(sql_query)
+        return int(result.scalar_one() or 0)
+
+    async def get_distinct_categories(self) -> list[str]:
+        query = select(ExhibitORM.category).where(ExhibitORM.is_active.is_(True)).where(ExhibitORM.category.isnot(None))
+        query = self._apply_hall_visibility(query).distinct().order_by(ExhibitORM.category)
+        result = await self._session.execute(query)
+        return [row[0] for row in result.all() if row[0] is not None]
+
+    async def get_distinct_halls(self) -> list[str]:
+        query = select(ExhibitORM.hall).where(ExhibitORM.is_active.is_(True)).where(ExhibitORM.hall.isnot(None))
+        query = self._apply_hall_visibility(query).distinct().order_by(ExhibitORM.hall)
+        result = await self._session.execute(query)
+        return [row[0] for row in result.all() if row[0] is not None]

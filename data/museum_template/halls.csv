@@ -1,0 +1,2 @@
+﻿source_record_id,slug,name,description,floor,estimated_duration_minutes,display_order,is_active,suggested_questions,short_description,is_temporary,aliases
+H001,main-hall,请填写展厅名称,配置模板占位条目，请替换为馆方确认的展厅主题、展陈范围和介绍。,1,20,1,true,,请填写展厅简介,false,[]

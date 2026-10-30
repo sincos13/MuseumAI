@@ -1,0 +1,2 @@
+﻿source_record_id,name,description,hall,floor,category,era,importance,estimated_visit_time,display_order,location_x,location_y,is_active,suggested_questions,image_url
+E001,请填写展品名称,配置模板占位条目，没有真实文物事实。请填写馆方核实的外观、用途及可确认的历史背景。,main-hall,1,pottery,请填写年代或明确未知,3,5,1,,,true,,

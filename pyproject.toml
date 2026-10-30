@@ -1,0 +1,142 @@
+[project]
+name = "museai"
+version = "0.1.0"
+description = "MuseAI - Museum AI Guide System"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "email-validator>=2.1.0",
+    # elasticsearch 9.x removes the sync-client wrapper used in test setup.
+    # Upgrade path: rewrite test fixtures to use the new async-only client.
+    "elasticsearch>=8.15.0,<9.0.0",
+    "asyncpg>=0.30.0",
+    "sqlalchemy>=2.0.0",
+    "redis>=5.2.0",
+    "httpx>=0.28.0",
+    "python-multipart>=0.0.17",
+    "python-dateutil>=2.9.0",
+    "python-jose[cryptography]>=3.3.0",
+    "bcrypt>=4.0.0",
+    "openai>=1.57.0",
+    "aiohttp>=3.13.5",
+    "langchain>=1.2.14,<2.0.0",
+    "langchain-core>=1.2.22,<2.0.0",
+    # langchain-community 0.4 breaks the RetrieverInterface we depend on
+    # (_get_relevant_documents / _aget_relevant_documents signature changed).
+    # Upgrade path: migrate to the new asyncio-only signature throughout
+    # infra/langchain/retrievers.py.
+    "langchain-community>=0.3.0,<0.4.0",
+    "langchain-openai>=1.1.12,<2.0.0",
+    "langchain-elasticsearch>=1.0.0,<2.0.0",
+    "langgraph>=1.1.3,<2.0.0",
+    "loguru>=0.7.0",
+    "aiofiles>=24.1.0",
+    "alembic>=1.18.4",
+    "psycopg2-binary>=2.9.11",
+    "openpyxl>=3.1.5,<4.0.0",
+    "pillow>=11.0.0,<13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "httpx>=0.28.0",
+    "aiosqlite>=0.20.0",
+    "locust>=2.20.0",
+    "bandit>=1.7.0",
+    "pip-audit>=2.6.0",
+]
+performance = [
+    "locust>=2.20.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/tests/performance/*.py" = ["E402"]
+"backend/alembic/versions/*.py" = []
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+explicit_package_bases = true
+mypy_path = "backend"
+namespace_packages = true
+exclude = [
+    "^backend/tests/",
+    "^backend/alembic/",
+    "^backend/scripts/",
+]
+
+# TODO(B8): re-enable strict once tech debt from 2026-04-17 audit is repaid.
+# Strict only for well-structured layers; the rest is tech debt for later batches.
+[[tool.mypy.overrides]]
+module = ["app.domain.*", "app.application.ports.*"]
+disallow_untyped_defs = true
+disallow_any_generics = true
+
+[[tool.mypy.overrides]]
+module = [
+    "app.api.*",
+    "app.application.*",
+    "app.infra.*",
+    "app.workflows.*",
+    "app.main",
+    "app.config.*",
+    "app.observability.*",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+markers = [
+    "integration: marks tests as integration tests",
+    "e2e: marks tests as end-to-end tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["backend/app"]
+branch = true
+omit = [
+    "backend/app/__init__.py",
+    "backend/tests/*",
+]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/app"]

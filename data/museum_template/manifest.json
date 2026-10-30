@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "museum_id": "my-museum",
+  "knowledge": [
+    {
+      "id": "exhibit-001",
+      "file": "knowledge/exhibit-001.txt",
+      "title": "请填写展品名称",
+      "source_label": "请填写馆方审核资料名称及版本",
+      "source_url": "",
+      "hall_slug": "main-hall"
+    }
+  ],
+  "images": []
+}

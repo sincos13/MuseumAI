@@ -1,0 +1,100 @@
+# Run through scripts/deploy_museum.py; one project, network and set of volumes per museum.
+x-backend: &backend
+  build:
+    context: ../..
+    dockerfile: deploy/standalone/backend.Dockerfile
+  env_file:
+    - ${MUSEUM_INSTANCE_DIR:?required}/app.env
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  volumes:
+    - exhibit_images:/app/var/exhibit-images
+    - museum_imports:/app/var/museum-imports
+    - backend_logs:/app/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    elasticsearch:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: museai
+      POSTGRES_USER: museai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U museai -d museai']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, 'yes']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  elasticsearch:
+    build:
+      context: ../../docker/elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: 'false'
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    mem_limit: 1536m
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: [CMD-SHELL, 'curl -fsS http://localhost:9200/_cluster/health >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+  backend:
+    <<: *backend
+    command: [python, -m, uvicorn, app.main:app, --host, 0.0.0.0, --port, '8000', --no-proxy-headers]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+    restart: unless-stopped
+  frontend:
+    build:
+      context: ../..
+      dockerfile: deploy/standalone/frontend.Dockerfile
+    ports:
+      - '${MUSEUM_BIND_ADDRESS:-127.0.0.1}:${MUSEUM_HTTP_PORT:-8081}:80'
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+  operator:
+    <<: *backend
+    profiles: [tools]
+    volumes:
+      - ${MUSEUM_PACKAGE_DIR:-../../data/museum_template}:/museum-package:ro
+      - exhibit_images:/app/var/exhibit-images
+      - museum_imports:/app/var/museum-imports
+      - backend_logs:/app/logs
+    environment:
+      MUSEAI_ADMIN_PASSWORD: ${MUSEAI_ADMIN_PASSWORD:-}
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  exhibit_images:
+  museum_imports:
+  backend_logs:
